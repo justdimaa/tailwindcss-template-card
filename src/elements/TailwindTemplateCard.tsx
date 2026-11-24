@@ -9,6 +9,19 @@ import { Action, Binding } from "@types";
 import { HomeAssistant } from "custom-card-helpers";
 import _ from "lodash";
 
+type Unsubscribe = () => Promise<void>;
+
+// One live render_template subscription. Home Assistant re-renders the template on its own whenever an entity
+// it uses changes (and every minute for now()), and pushes each new result to it, so a card needs exactly one
+// per template while it is on the page.
+interface TemplateSubscription {
+  template: string;
+  connection: HomeAssistant["connection"];
+  unsubscribe: Promise<Unsubscribe>;
+  active: boolean;
+  rendered: boolean;
+}
+
 console.info(
   `%c  TailwindCSS Template Card  \n%c  Version ${CARD_VERSION}  \n%c  Star it at http://github.com/usernein/tailwindcss-template-card!`,
   "color: #2d2c35; font-weight: bold; background: #f5f6f9",
@@ -19,9 +32,24 @@ console.info(
 export class TailwindTemplateCard extends TailwindTemplateRenderer {
   _entitiesToWatch: string[] = [];
   _htmlContent: string = "";
+  _templateSubscription: TemplateSubscription | undefined;
+  // Classes each element got from "class" bindings, so the next run can take them off again.
+  _boundClasses = new WeakMap<Element, Map<number, string>>();
 
   constructor() {
     super();
+  }
+
+  connectedCallback() {
+    // Back on the page (first time, or after switching views): start listening again.
+    if (this._hass && this._config?.content !== undefined) {
+      this.processAndRender(true);
+    }
+  }
+
+  disconnectedCallback() {
+    // Off the page: stop Home Assistant rendering this card's template for nobody.
+    this.unsubscribeTemplate();
   }
 
   static getConfigElement() {
@@ -83,7 +111,7 @@ export class TailwindTemplateCard extends TailwindTemplateRenderer {
 
   renderIfNeeded(forceUpdate?: boolean) {
     if (forceUpdate || this.needsRender()) {
-      this.processAndRender();
+      this.processAndRender(forceUpdate);
     }
   }
 
@@ -132,7 +160,7 @@ export class TailwindTemplateCard extends TailwindTemplateRenderer {
     return 1;
   }
 
-  processAndRender() {
+  processAndRender(forceRender?: boolean) {
     if (!this._hass || !this._config || this._config.content == undefined)
       return;
 
@@ -146,21 +174,80 @@ export class TailwindTemplateCard extends TailwindTemplateRenderer {
     }
 
     if (!this._config.parse_jinja) {
+      this.unsubscribeTemplate();
       this._htmlContent = content;
       this._renderHtmlContent();
       return;
     }
 
-    this._hass.connection.subscribeMessage(
+    const current = this._templateSubscription;
+    if (
+      current &&
+      current.template === content &&
+      current.connection === this._hass.connection
+    ) {
+      // Already subscribed: Home Assistant sends new HTML by itself when the template's result changes.
+      // A changed entity only needs the bindings run again, and a new config (actions, plugins) a re-render.
+      if (!current.rendered) return;
+      if (forceRender) this._renderHtmlContent();
+      else this.applyBindings();
+      return;
+    }
+
+    this.subscribeTemplate(content);
+  }
+
+  subscribeTemplate(template: string) {
+    this.unsubscribeTemplate();
+    // Cards are set up before they are added to the page; connectedCallback subscribes then.
+    if (!this._hass || !this.isConnected) return;
+
+    const connection = this._hass.connection;
+    const subscription = {
+      template,
+      connection,
+      active: true,
+      rendered: false,
+    } as TemplateSubscription;
+
+    subscription.unsubscribe = connection.subscribeMessage(
       (msg: { result: string }) => {
+        if (!subscription.active) return;
+        if (subscription.rendered && msg.result === this._htmlContent) {
+          this.applyBindings();
+          return;
+        }
+        subscription.rendered = true;
         this._htmlContent = msg.result;
         this._renderHtmlContent();
       },
       {
         type: "render_template",
-        template: content,
+        template,
       },
     );
+    subscription.unsubscribe.catch((err: unknown) => {
+      // Kept as the current subscription, so a broken template is not retried on every entity change,
+      // only when the template or the connection changes.
+      if (subscription.active) {
+        console.error("tailwindcss-template-card: template failed", err);
+      }
+    });
+
+    this._templateSubscription = subscription;
+  }
+
+  unsubscribeTemplate() {
+    const subscription = this._templateSubscription;
+    if (!subscription) return;
+
+    this._templateSubscription = undefined;
+    subscription.active = false;
+    subscription.unsubscribe
+      .then((unsubscribe) => unsubscribe())
+      .catch(() => {
+        // It never started (template error) or the connection is gone: nothing left to stop.
+      });
   }
 
   _render(forceRender?: boolean) {
@@ -202,7 +289,7 @@ export class TailwindTemplateCard extends TailwindTemplateRenderer {
   applyBindings() {
     if (!this._config?.bindings) return;
 
-    this._config.bindings.forEach((binding: Binding) => {
+    this._config.bindings.forEach((binding: Binding, index: number) => {
       if (!binding.selector || !binding.bind || !binding.type) return;
       const matches = this.shadow.querySelectorAll(binding.selector);
 
@@ -218,9 +305,24 @@ export class TailwindTemplateCard extends TailwindTemplateRenderer {
           case "html":
             target.innerHTML = result;
             break;
-          case "class":
-            result && target.classList.add(result);
+          case "class": {
+            // Bindings now also run when an entity changes without a re-render, so swap the class this
+            // binding added last time instead of piling classes up.
+            let added = this._boundClasses.get(target);
+            if (!added) {
+              added = new Map();
+              this._boundClasses.set(target, added);
+            }
+            const previous = added.get(index);
+            if (previous && previous !== result) target.classList.remove(previous);
+            if (result) {
+              target.classList.add(result);
+              added.set(index, result);
+            } else {
+              added.delete(index);
+            }
             break;
+          }
           case "checked":
             targetAsInput.checked = Boolean(result);
             break;
